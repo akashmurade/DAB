@@ -1,0 +1,126 @@
+name: Deploy Databricks Bundles
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+jobs:
+  # --------------------------------------------------------
+  # JOB 1: Detect Changes
+  # --------------------------------------------------------
+  detect-changed-bundles:
+    runs-on: ubuntu-latest
+    outputs:
+      bundles: ${{ steps.set-bundles.outputs.bundles }}
+      has-changes: ${{ steps.set-bundles.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # Required to see commit history
+
+      - name: Detect changed bundles
+        id: set-bundles
+        run: |
+          # 1. Determine the Base Commit for Diff
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+            HEAD_REF="${{ github.event.pull_request.head.sha }}"
+          else
+            # For Pushes: Compare against the commit BEFORE this push
+            BASE_REF="${{ github.event.before }}"
+            HEAD_REF="${{ github.sha }}"
+          fi
+          
+          echo "Comparing changes from $BASE_REF to $HEAD_REF"
+
+          # 2. Find all directories containing databricks.yml
+          # We search one level deep (bundles/*) or strictly assume structure
+          ALL_BUNDLES=$(find bundles -name "databricks.yml" -exec dirname {} \; | sort -u)
+
+          # 3. Check for changes
+          CHANGED_BUNDLES=""
+          for bundle_dir in $ALL_BUNDLES; do
+            # Check if any file in this folder changed between Base and Head
+            if git diff --name-only $BASE_REF $HEAD_REF | grep -q "^${bundle_dir}/"; then
+              bundle_name=$(basename $bundle_dir)
+              CHANGED_BUNDLES="$CHANGED_BUNDLES\"$bundle_name\","
+            fi
+          done
+
+          # 4. Format Output JSON
+          if [ -n "$CHANGED_BUNDLES" ]; then
+            # Remove trailing comma and wrap in brackets
+            CHANGED_BUNDLES="[${CHANGED_BUNDLES%,}]"
+            echo "bundles=$CHANGED_BUNDLES" >> $GITHUB_OUTPUT
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "bundles=[]" >> $GITHUB_OUTPUT
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Detected Changes in: $CHANGED_BUNDLES"
+
+  # --------------------------------------------------------
+  # JOB 2: Validate (Runs on Dev Credentials)
+  # --------------------------------------------------------
+  validate-bundles:
+    needs: detect-changed-bundles
+    if: needs.detect-changed-bundles.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bundle: ${{ fromJson(needs.detect-changed-bundles.outputs.bundles) }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: databricks/setup-cli@main
+
+      - name: Validate (Target Dev)
+        run: |
+          cd bundles/${{ matrix.bundle }}
+          databricks bundle validate -t dev
+        env:
+          DATABRICKS_HOST: ${{ secrets.DEV_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DEV_TOKEN }}
+
+      - name: Validate (Target Prod)
+        run: |
+          cd bundles/${{ matrix.bundle }}
+          databricks bundle validate -t prod
+        env:
+          DATABRICKS_HOST: ${{ secrets.PROD_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.PROD_TOKEN }}
+
+  # --------------------------------------------------------
+  # JOB 3: Deploy (Dynamic Target & Secrets)
+  # --------------------------------------------------------
+  deploy-bundles:
+    needs: [detect-changed-bundles, validate-bundles]
+    # Only run on Push (Merge), not PRs
+    if: github.event_name == 'push' && needs.detect-changed-bundles.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bundle: ${{ fromJson(needs.detect-changed-bundles.outputs.bundles) }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy Bundle
+        run: |
+          cd bundles/${{ matrix.bundle }}
+          
+          # Logic to switch target based on Branch
+          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "Branch is Main -> Deploying to PROD"
+            databricks bundle deploy -t prod
+          else
+            echo "Branch is Develop -> Deploying to DEV"
+            databricks bundle deploy -t dev
+          fi
+        env:
+          # DYNAMIC SECRET MAPPING
+          # If main, use PROD secrets. If develop, use DEV secrets.
+          DATABRICKS_HOST: ${{ github.ref == 'refs/heads/main' && secrets.PROD_HOST || secrets.DEV_HOST }}
+          DATABRICKS_TOKEN: ${{ github.ref == 'refs/heads/main' && secrets.PROD_TOKEN || secrets.DEV_TOKEN }}
